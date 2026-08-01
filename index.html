@@ -6,6 +6,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -422,20 +423,35 @@
     <div class="grid-ledger" id="checklistForm">
       <div class="card"><label>Título</label><input type="text" id="pTitulo" placeholder="Ej. Permiso de uso de suelo"></div>
       <div class="card"><label>Categoría</label>
-        <select id="pCategoria">
+        <select id="pCategoria" onchange="document.getElementById('pDetalleWrap').style.display = this.value==='otro' ? 'flex' : 'none';">
           <option value="tramite">Trámite</option>
           <option value="proceso">Proceso</option>
           <option value="gasto">Gasto</option>
           <option value="compra">Compra</option>
+          <option value="publicidad">Publicidad</option>
+          <option value="obra_civil">Obra civil</option>
+          <option value="vestido">Vestido</option>
           <option value="otro">Otro</option>
         </select>
       </div>
       <div class="card"><label>Fecha compromiso</label><input type="date" id="pFechaCompromiso"></div>
       <div class="card"><label>Responsable</label><input type="text" id="pResponsable" placeholder="Opcional"></div>
+      <div class="card" id="pDetalleWrap" style="display:none;"><label>Detalla el "Otro"</label><input type="text" id="pDetalle" placeholder="¿Qué es exactamente?"></div>
       <button class="add-btn" id="btnAgregarPendiente">Agregar al checklist</button>
     </div>
 
     <div class="result-strip" id="checklistResumen"></div>
+
+    <div class="card" id="csvImportCard" style="margin-bottom:24px;">
+      <label>Carga masiva por CSV</label>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:6px;">
+        <input type="file" id="csvFile" accept=".csv">
+        <button class="edit-btn" id="btnDescargarPlantilla" type="button">Descargar plantilla</button>
+        <button class="add-btn" id="btnImportarCsv" style="grid-column:auto; height:38px; padding:0 16px;" type="button">Importar CSV</button>
+      </div>
+      <div class="hint" style="margin-top:8px;">Columnas esperadas: <code>titulo, categoria, fecha_compromiso, responsable, notas</code>. Fecha en formato AAAA-MM-DD. Categoría: tramite, proceso, gasto, compra, publicidad, obra_civil, vestido u otro (si no coincide, se guarda como "otro" con el texto original en notas).</div>
+      <div id="csvResultado" style="margin-top:10px; font-size:12.5px;"></div>
+    </div>
 
     <div class="table-wrap">
       <table id="tablaChecklist">
@@ -564,6 +580,7 @@ let state = {
 
 let chartInversion, chartOperacion, chartEquilibrio, chartResumen;
 let editingId = null;
+let editingPendienteId = null;
 
 /* ---------- LOGIN ---------- */
 const DOMINIO_USUARIOS = 'goodhabits.local'; // correo interno, no recibe nada real
@@ -622,6 +639,7 @@ function applyRoleGating(){
   document.getElementById('checklistForm').style.display = puedeCapturar ? 'grid' : 'none';
   const gateChecklist = document.getElementById('checklistGate');
   gateChecklist.innerHTML = puedeCapturar ? '' : `<div class="readonly-note">Tu cuenta es de solo lectura: puedes ver el checklist, pero no agregar ni marcar cumplimientos.</div>`;
+  document.getElementById('csvImportCard').style.display = puedeCapturar ? 'block' : 'none';
 
   ['montoInicial','reservaPct','capitalOperativo'].forEach(id=>{
     document.getElementById(id).disabled = !puedeAdmin;
@@ -1173,8 +1191,98 @@ function renderAll(){
   renderOperacionTab(); renderEquilibrio(); renderVentas(); renderResumen(); renderChecklist();
 }
 
+/* ---------- IMPORTACIÓN CSV DEL CHECKLIST ---------- */
+document.getElementById('btnDescargarPlantilla').addEventListener('click', ()=>{
+  const csv = 'titulo,categoria,fecha_compromiso,responsable,notas\n'
+    + 'Permiso de uso de suelo,tramite,2026-08-15,Miguel,\n'
+    + 'Compra de uniformes,vestido,2026-08-20,Adriana,Tallas chica y mediana\n';
+  const blob = new Blob([csv], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'plantilla-checklist.csv';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+});
+
+function normalizarTexto(t){
+  return (t||'').toString().trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+}
+function detectarCategoria(valor){
+  const v = normalizarTexto(valor);
+  const mapa = {
+    'tramite':'tramite', 'proceso':'proceso', 'gasto':'gasto', 'compra':'compra',
+    'publicidad':'publicidad', 'obra civil':'obra_civil', 'obra_civil':'obra_civil',
+    'vestido':'vestido', 'otro':'otro'
+  };
+  return mapa[v] || null;
+}
+function fechaValida(f){
+  return /^\d{4}-\d{2}-\d{2}$/.test((f||'').toString().trim());
+}
+
+document.getElementById('btnImportarCsv').addEventListener('click', ()=>{
+  if(myRole !== 'admin' && myRole !== 'captura'){ alert('Tu rol no tiene permiso para capturar.'); return; }
+  const fileInput = document.getElementById('csvFile');
+  if(!fileInput.files.length){ alert('Selecciona primero un archivo CSV.'); return; }
+
+  Papa.parse(fileInput.files[0], {
+    header: true,
+    skipEmptyLines: true,
+    complete: async (results) => {
+      const filas = results.data;
+      const validas = [];
+      const errores = [];
+
+      filas.forEach((fila, i) => {
+        const titulo = (fila.titulo||'').trim();
+        const fecha_compromiso = (fila.fecha_compromiso||'').trim();
+        const responsable = (fila.responsable||'').trim() || null;
+        let notas = (fila.notas||'').trim() || null;
+        const catDetectada = detectarCategoria(fila.categoria);
+
+        if(!titulo){ errores.push(`Fila ${i+2}: falta título.`); return; }
+        if(!fechaValida(fecha_compromiso)){ errores.push(`Fila ${i+2} ("${titulo}"): fecha inválida, debe ser AAAA-MM-DD.`); return; }
+
+        let categoria = catDetectada;
+        if(!categoria){
+          categoria = 'otro';
+          const original = (fila.categoria||'').trim();
+          notas = notas ? `${notas} (categoría original: ${original})` : `Categoría original: ${original}`;
+        }
+        validas.push({ titulo, categoria, fecha_compromiso, responsable, notas });
+      });
+
+      const resDiv = document.getElementById('csvResultado');
+      if(!validas.length){
+        resDiv.innerHTML = `<div class="banner bad">No se importó nada. ${errores.length} fila(s) con error:<br>${errores.join('<br>')}</div>`;
+        return;
+      }
+
+      const { data, error } = await sb.from('pendientes').insert(validas).select();
+      if(error){
+        resDiv.innerHTML = `<div class="banner bad">Error al importar: ${error.message}</div>`;
+        return;
+      }
+
+      state.pendientes.push(...data);
+      data.forEach(d => { state.perfiles[d.created_by] = session.user.email; });
+      renderAll();
+      if(myRole==='admin') loadAuditoria();
+      toast();
+
+      let msg = `<div class="banner ok">${data.length} elemento(s) importado(s) correctamente.</div>`;
+      if(errores.length) msg += `<div class="banner warn">${errores.length} fila(s) con error, no se importaron:<br>${errores.join('<br>')}</div>`;
+      resDiv.innerHTML = msg;
+      fileInput.value = '';
+    },
+    error: (err) => {
+      document.getElementById('csvResultado').innerHTML = `<div class="banner bad">No se pudo leer el archivo: ${err.message}</div>`;
+    }
+  });
+});
+
 /* ---------- CHECKLIST DE CUMPLIMIENTO ---------- */
-const CATEGORIA_LABEL = {tramite:'Trámite', proceso:'Proceso', gasto:'Gasto', compra:'Compra', otro:'Otro'};
+const CATEGORIA_LABEL = {tramite:'Trámite', proceso:'Proceso', gasto:'Gasto', compra:'Compra', publicidad:'Publicidad', obra_civil:'Obra civil', vestido:'Vestido', otro:'Otro'};
 
 function diasEntre(a, b){
   // días completos entre dos fechas 'YYYY-MM-DD', b - a
@@ -1201,10 +1309,11 @@ document.getElementById('btnAgregarPendiente').addEventListener('click', async (
   const categoria = document.getElementById('pCategoria').value;
   const fecha_compromiso = document.getElementById('pFechaCompromiso').value;
   const responsable = document.getElementById('pResponsable').value.trim();
+  const notas = categoria==='otro' ? document.getElementById('pDetalle').value.trim() : null;
   if(!titulo || !fecha_compromiso){ alert('Captura al menos el título y la fecha compromiso.'); return; }
 
   const { data, error } = await sb.from('pendientes')
-    .insert({ titulo, categoria, fecha_compromiso, responsable })
+    .insert({ titulo, categoria, fecha_compromiso, responsable, notas })
     .select().single();
   if(error){ alert('No se pudo guardar: '+error.message); return; }
 
@@ -1213,10 +1322,34 @@ document.getElementById('btnAgregarPendiente').addEventListener('click', async (
   document.getElementById('pTitulo').value='';
   document.getElementById('pResponsable').value='';
   document.getElementById('pFechaCompromiso').value='';
+  document.getElementById('pDetalle').value='';
+  document.getElementById('pDetalleWrap').style.display='none';
+  document.getElementById('pCategoria').value='tramite';
   renderChecklist();
   if(myRole==='admin') loadAuditoria();
   toast();
 });
+
+async function guardarEdicionPendiente(id){
+  if(myRole !== 'admin' && myRole !== 'captura') return;
+  const titulo = document.getElementById(`ep_titulo_${id}`).value.trim();
+  const categoria = document.getElementById(`ep_categoria_${id}`).value;
+  if(!titulo){ alert('El título no puede quedar vacío.'); return; }
+
+  const { data, error } = await sb.from('pendientes').update({ titulo, categoria }).eq('id', id).select().single();
+  if(error){
+    alert('No se pudo guardar: ' + (error.message.includes('cumplido o vencido')
+      ? 'Este pendiente ya se cumplió o venció, así que ya no se puede editar.'
+      : error.message));
+    return;
+  }
+  const idx = state.pendientes.findIndex(p=>p.id===id);
+  if(idx>-1) state.pendientes[idx] = data;
+  editingPendienteId = null;
+  renderChecklist();
+  if(myRole==='admin') loadAuditoria();
+  toast();
+}
 
 async function marcarCumplido(id){
   if(myRole !== 'admin' && myRole !== 'captura') return;
@@ -1271,6 +1404,7 @@ function renderChecklist(){
     const acciones = [];
     if(myRole==='admin' || myRole==='captura'){
       if(!p.fecha_cumplimiento) acciones.push(`<button class="check-btn" data-check="${p.id}">Marcar cumplido</button>`);
+      if(est.tipo==='pendiente') acciones.push(`<button class="edit-btn" data-editpend="${p.id}">Editar</button>`);
     }
     if(myRole==='admin'){
       if(p.fecha_cumplimiento) acciones.push(`<button class="edit-btn" data-reopen="${p.id}">Reabrir</button>`);
@@ -1278,21 +1412,37 @@ function renderChecklist(){
     }
 
     const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td style="text-align:left;">${p.titulo}</td>
-      <td style="text-align:left;">${CATEGORIA_LABEL[p.categoria]||p.categoria}</td>
-      <td class="mes-cell">${fmtDate(p.fecha_compromiso)}</td>
-      <td class="mes-cell">${p.fecha_cumplimiento ? fmtDate(p.fecha_cumplimiento) : '—'}</td>
-      <td><span class="estatus-pill ${est.tipo}">${est.texto}</span></td>
-      <td style="text-align:left;">${p.responsable||'—'}</td>
-      <td style="white-space:nowrap;">${acciones.join('')}</td>
-    `;
+    if(editingPendienteId === p.id){
+      const opciones = Object.keys(CATEGORIA_LABEL).map(k=>`<option value="${k}" ${k===p.categoria?'selected':''}>${CATEGORIA_LABEL[k]}</option>`).join('');
+      tr.innerHTML = `
+        <td style="text-align:left;"><input class="edit-input text-left" id="ep_titulo_${p.id}" value="${p.titulo.replace(/"/g,'&quot;')}"></td>
+        <td style="text-align:left;"><select class="edit-input" id="ep_categoria_${p.id}">${opciones}</select></td>
+        <td class="mes-cell">${fmtDate(p.fecha_compromiso)}</td>
+        <td class="mes-cell">${p.fecha_cumplimiento ? fmtDate(p.fecha_cumplimiento) : '—'}</td>
+        <td><span class="estatus-pill ${est.tipo}">${est.texto}</span></td>
+        <td style="text-align:left;">${p.responsable||'—'}</td>
+        <td style="white-space:nowrap;"><button class="save-btn" data-savepend="${p.id}">Guardar</button><button class="cancel-btn" data-cancelpend="1">Cancelar</button></td>
+      `;
+    } else {
+      tr.innerHTML = `
+        <td style="text-align:left;">${p.titulo}${p.notas ? `<br><span style="font-size:10.5px;color:var(--paper-dim);">${p.notas}</span>` : ''}</td>
+        <td style="text-align:left;">${CATEGORIA_LABEL[p.categoria]||p.categoria}</td>
+        <td class="mes-cell">${fmtDate(p.fecha_compromiso)}</td>
+        <td class="mes-cell">${p.fecha_cumplimiento ? fmtDate(p.fecha_cumplimiento) : '—'}</td>
+        <td><span class="estatus-pill ${est.tipo}">${est.texto}</span></td>
+        <td style="text-align:left;">${p.responsable||'—'}</td>
+        <td style="white-space:nowrap;">${acciones.join('')}</td>
+      `;
+    }
     tbody.appendChild(tr);
   });
 
   tbody.querySelectorAll('[data-check]').forEach(btn=> btn.addEventListener('click', e=> marcarCumplido(e.target.dataset.check)));
   tbody.querySelectorAll('[data-reopen]').forEach(btn=> btn.addEventListener('click', e=> reabrirPendiente(e.target.dataset.reopen)));
   tbody.querySelectorAll('[data-delpend]').forEach(btn=> btn.addEventListener('click', e=> borrarPendiente(e.target.dataset.delpend)));
+  tbody.querySelectorAll('[data-editpend]').forEach(btn=> btn.addEventListener('click', e=>{ editingPendienteId = e.target.dataset.editpend; renderChecklist(); }));
+  tbody.querySelectorAll('[data-cancelpend]').forEach(btn=> btn.addEventListener('click', ()=>{ editingPendienteId = null; renderChecklist(); }));
+  tbody.querySelectorAll('[data-savepend]').forEach(btn=> btn.addEventListener('click', e=> guardarEdicionPendiente(e.target.dataset.savepend)));
 
   const resumen = document.getElementById('checklistResumen');
   resumen.innerHTML = `
