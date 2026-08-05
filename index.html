@@ -665,7 +665,7 @@ async function loadAll(){
 
   const ids = [...new Set([...state.movimientos.map(m=>m.created_by), ...state.pendientes.map(p=>p.created_by)])];
   if(ids.length){
-    const { data: perfiles } = await sb.from('profiles').select('id,email').in('id', ids);
+    const { data: perfiles } = await sb.from('directorio_usuarios').select('id,email').in('id', ids);
     (perfiles||[]).forEach(p=> state.perfiles[p.id] = p.email);
   }
 
